@@ -12,6 +12,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
 
     // Move query to SRAM
     gpu_sim.MoveMatrixToSharedMem(current_query);
+    gpu_sim.Run(false, &matrix_memory_allocator);
 
     // Create SRAM copies of keys (transposed) and values for this round
     std::vector<Matrix *> sram_keys;
@@ -19,13 +20,17 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     for (size_t j = 0; j <= i; ++j) {
       Matrix *k_copy = matrix_memory_allocator.Allocate("key_copy");
       gpu_sim.Copy(keys[j], k_copy, kInGpuHbm);
+      gpu_sim.Run(false, &matrix_memory_allocator); // ensure copy completes (k_copy in HBM)
       gpu_sim.MoveMatrixToSharedMem(k_copy);
+      gpu_sim.Run(false, &matrix_memory_allocator); // ensure move completes (k_copy in SRAM)
       gpu_sim.Transpose(k_copy, kInSharedMemory);
       sram_keys.push_back(k_copy);
 
       Matrix *v_copy = matrix_memory_allocator.Allocate("value_copy");
       gpu_sim.Copy(values[j], v_copy, kInGpuHbm);
+      gpu_sim.Run(false, &matrix_memory_allocator);
       gpu_sim.MoveMatrixToSharedMem(v_copy);
+      gpu_sim.Run(false, &matrix_memory_allocator);
       sram_values.push_back(v_copy);
     }
 
