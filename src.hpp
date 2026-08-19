@@ -10,53 +10,71 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     auto current_query = rater.GetNextQuery();
     // current_query is in HBM, shape [i+1, 512]
 
-    // 1. Build K_concat and V_concat in HBM (using copies to avoid modifying
-    // original keys/values)
-    Matrix *K_concat = matrix_memory_allocator.Allocate("K_concat");
-    gpu_sim.Copy(keys[0], K_concat, kInGpuHbm);
-    for (size_t j = 1; j <= i; ++j) {
-      Matrix *new_K = matrix_memory_allocator.Allocate("K_concat_tmp");
-      gpu_sim.Concat(K_concat, keys[j], new_K, 0, kInGpuHbm);
-      gpu_sim.ReleaseMatrix(K_concat);
-      K_concat = new_K;
-    }
-    Matrix *V_concat = matrix_memory_allocator.Allocate("V_concat");
-    gpu_sim.Copy(values[0], V_concat, kInGpuHbm);
-    for (size_t j = 1; j <= i; ++j) {
-      Matrix *new_V = matrix_memory_allocator.Allocate("V_concat_tmp");
-      gpu_sim.Concat(V_concat, values[j], new_V, 0, kInGpuHbm);
-      gpu_sim.ReleaseMatrix(V_concat);
-      V_concat = new_V;
-    }
-
-    // 2. Move Q, K_concat, V_concat to SRAM for calculation
+    // Move query to SRAM
     gpu_sim.MoveMatrixToSharedMem(current_query);
-    gpu_sim.MoveMatrixToSharedMem(K_concat);
-    gpu_sim.MoveMatrixToSharedMem(V_concat);
 
-    // 3. Transpose K_concat in SRAM to obtain K^T (shape [d, i+1])
-    gpu_sim.Transpose(K_concat, kInSharedMemory);
+    // Create SRAM copies of keys (transposed) and values for this round
+    std::vector<Matrix *> sram_keys;
+    std::vector<Matrix *> sram_values;
+    for (size_t j = 0; j <= i; ++j) {
+      Matrix *k_copy = matrix_memory_allocator.Allocate("key_copy");
+      gpu_sim.Copy(keys[j], k_copy, kInGpuHbm);
+      gpu_sim.MoveMatrixToSharedMem(k_copy);
+      gpu_sim.Transpose(k_copy, kInSharedMemory);
+      sram_keys.push_back(k_copy);
 
-    // 4. Compute attention row by row
+      Matrix *v_copy = matrix_memory_allocator.Allocate("value_copy");
+      gpu_sim.Copy(values[j], v_copy, kInGpuHbm);
+      gpu_sim.MoveMatrixToSharedMem(v_copy);
+      sram_values.push_back(v_copy);
+    }
+
     Matrix *answer_concat = nullptr;
     for (size_t r = 0; r <= i; ++r) {
       Matrix *q_row = matrix_memory_allocator.Allocate("q_row");
       gpu_sim.GetRow(current_query, r, q_row, kInSharedMemory);
 
-      Matrix *scores = matrix_memory_allocator.Allocate("scores");
-      gpu_sim.MatMul(q_row, K_concat, scores);
+      // Compute scores by dot product with each key
+      Matrix *scores = nullptr;
+      for (size_t j = 0; j <= i; ++j) {
+        Matrix *score_j = matrix_memory_allocator.Allocate("score_j");
+        gpu_sim.MatMul(q_row, sram_keys[j], score_j);
+        if (j == 0) {
+          scores = score_j;
+        } else {
+          Matrix *new_scores = matrix_memory_allocator.Allocate("scores");
+          gpu_sim.Concat(scores, score_j, new_scores, 1, kInSharedMemory);
+          gpu_sim.ReleaseMatrix(scores);
+          gpu_sim.ReleaseMatrix(score_j);
+          scores = new_scores;
+        }
+      }
 
       Matrix *exp_scores = matrix_memory_allocator.Allocate("exp_scores");
       gpu_sim.MatExp(scores, exp_scores);
-
       Matrix *sum_exp = matrix_memory_allocator.Allocate("sum_exp");
       gpu_sim.Sum(exp_scores, sum_exp);
-
       Matrix *softmax = matrix_memory_allocator.Allocate("softmax");
       gpu_sim.MatDiv(exp_scores, sum_exp, softmax);
 
-      Matrix *out_row = matrix_memory_allocator.Allocate("out_row");
-      gpu_sim.MatMul(softmax, V_concat, out_row);
+      // Compute out_row = sum_j softmax[j] * value_j
+      Matrix *out_row = nullptr;
+      for (size_t j = 0; j <= i; ++j) {
+        Matrix *softmax_j = matrix_memory_allocator.Allocate("softmax_j");
+        gpu_sim.GetColumn(softmax, j, softmax_j, kInSharedMemory);
+        Matrix *scaled_v = matrix_memory_allocator.Allocate("scaled_v");
+        gpu_sim.MulNum(sram_values[j], softmax_j, scaled_v);
+        if (j == 0) {
+          out_row = scaled_v;
+        } else {
+          Matrix *new_out = matrix_memory_allocator.Allocate("out_row");
+          gpu_sim.MatAdd(out_row, scaled_v, new_out);
+          gpu_sim.ReleaseMatrix(out_row);
+          gpu_sim.ReleaseMatrix(scaled_v);
+          out_row = new_out;
+        }
+        gpu_sim.ReleaseMatrix(softmax_j);
+      }
 
       if (r == 0) {
         answer_concat = out_row;
@@ -68,7 +86,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
         answer_concat = new_answer;
       }
 
-      // Release intermediate matrices that are no longer needed
+      // Release intermediate matrices for this row
       gpu_sim.ReleaseMatrix(q_row);
       gpu_sim.ReleaseMatrix(scores);
       gpu_sim.ReleaseMatrix(exp_scores);
@@ -76,21 +94,17 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.ReleaseMatrix(softmax);
     }
 
-    // 5. Release K_concat, V_concat, current_query (they are in SRAM and no
-    // longer needed)
-    gpu_sim.ReleaseMatrix(K_concat);
-    gpu_sim.ReleaseMatrix(V_concat);
+    // Release SRAM copies of keys and values
+    for (size_t j = 0; j <= i; ++j) {
+      gpu_sim.ReleaseMatrix(sram_keys[j]);
+      gpu_sim.ReleaseMatrix(sram_values[j]);
+    }
     gpu_sim.ReleaseMatrix(current_query);
 
-    // 6. Move the final answer to HBM
+    // Move final answer to HBM
     gpu_sim.MoveMatrixToGpuHbm(answer_concat);
-
-    // 7. Execute all queued instructions
     gpu_sim.Run(false, &matrix_memory_allocator);
-
-    // 8. Commit the answer (must be in HBM)
     rater.CommitAnswer(*answer_concat);
-    // answer_concat is released automatically by CommitAnswer
   }
 }
 
