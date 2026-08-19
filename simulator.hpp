@@ -795,6 +795,16 @@ void GpuSimulator::MatExp(Matrix *matrix, Matrix *result) {
                          result, kInSharedMemory});
 }
 
+void GpuSimulator::MatMulNum(Matrix *matrix, Matrix *factor, Matrix *result) {
+  calculate_queue_.push({-1, InstructionType::kMulNum, matrix, factor, 0,
+                         result, kInSharedMemory});
+}
+
+void GpuSimulator::MatAddBias(Matrix *matrix, Matrix *bias, Matrix *result) {
+  calculate_queue_.push({-1, InstructionType::kAddBias, matrix, bias, 0,
+                         result, kInSharedMemory});
+}
+
 void GpuSimulator::Copy(Matrix *src, Matrix *dest, Position position) {
   calculate_queue_.push(
       {-1, InstructionType::kCopy, src, nullptr, 0, dest, position});

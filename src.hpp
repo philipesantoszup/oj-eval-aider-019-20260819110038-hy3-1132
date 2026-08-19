@@ -63,7 +63,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
         Matrix *softmax_j = matrix_memory_allocator.Allocate("softmax_j");
         gpu_sim.GetColumn(softmax, j, softmax_j, kInSharedMemory);
         Matrix *scaled_v = matrix_memory_allocator.Allocate("scaled_v");
-        gpu_sim.MatMulNum(sram_values[j], softmax_j, scaled_v);
+        gpu_sim.MatMul(softmax_j, sram_values[j], scaled_v);
         if (j == 0) {
           out_row = scaled_v;
         } else {
